@@ -8,10 +8,13 @@
 #define MAX_TOKENS 100
 #define MAX_CMDS 20
 
+pid_t fg_pid = -1;
+
 typedef struct {
 	int id;
 	pid_t pid;
 	char cmd[256];
+	int stopped;
 } Job;
 
 Job jobs[100];
@@ -40,6 +43,42 @@ void shell_pwd() {
 	}
 }
 
+void shell_jobs() {
+	for(int i=0; i<job_count; i++) {
+		printf("[%d] %s %s\n",
+			jobs[i].id,
+			jobs[i].stopped ? "stopped" : "running",
+			jobs[i].cmd);
+	}
+}
+
+void shell_fg(int job_id) {
+	for(int i=0; i<job_count; i++){
+		if(jobs[i].id == job_id) {
+			fg_pid = jobs[i].pid;
+			kill(fg_pid, SIGCONT);
+			int status;
+			waitpid(fg_pid, &status, 0);
+			fg_pid = -1;
+
+			for(int j=i; j<job_count-1; j++) jobs[j] = jobs[j+1];
+			job_count--;
+			return;
+		}
+	}
+	printf("fg: no such job %d\n", job_id);
+}
+
+void shell_bg(int job_id) {
+	for(int i=0; i<job_count; i++) {
+		if(jobs[i].id == job_id) {
+			kill(jobs[i].pid, SIGCONT);
+			jobs[i].stopped = 0;
+			return;
+		}
+	}
+}
+
 // Execute command
 void shell_execute(char **args){
 	
@@ -55,6 +94,23 @@ void shell_execute(char **args){
 	}
 	if(strcmp(args[0], "exit") == 0) {
 		exit(0);
+	}
+	if(strcmp(args[0], "jobs") == 0) {
+		shell_jobs();
+	}
+	if(strcmp(args[0], "fg") == 0) {
+		if(args[1] != NULL && args[1][0] == '%') {
+			shell_fg(atoi(args[1] + 1));
+		} else {
+			printf("usage: fg %%jobid\n");
+		}
+	}
+	if(strcmp(args[0], "bg") == 0) {
+		if(args[1] != NULL && args[1][0] == '%') {
+			shell_bg(atoi(args[1] + 1));
+		} else {
+			printf("usage: bg %%jobid\n");
+		}
 	}
 	
 	int background = 0;
@@ -132,7 +188,9 @@ void shell_execute(char **args){
 		}
 		else {
 			int status;
+			fg_pid = pid;
 			waitpid(pid, &status, 0);
+			fg_pid = -1;
 		}
 	}else {
 		perror("fork");
@@ -283,7 +341,9 @@ void execute_pipeline(char ***commands, int n) {
 
 	// wait for all children
 	for (int i=0; i<n; i++) {
+		fg_pid = pids[i];
 		waitpid(pids[i], NULL, 0);
+		fg_pid = -1;
 	}
 }
 
@@ -333,20 +393,50 @@ void check_background_jobs() {
 	while((pid = waitpid(-1, &status, WNOHANG)) > 0) {
 		for(int i=0; i<job_count; i++){
 			if(jobs[i].pid == pid) {
-				printf("[done] %s (pid %d)\n", jobs[i].cmd, pid);
+				if(WIFEXITED(status) || WIFSIGNALED(status)) {
+					printf("[done] %s (pid %d)\n", jobs[i].cmd, pid);
 
-				// remove from list 
-				for(int j=i; j<job_count-1; j++) jobs[j] = jobs[j+1];
-				job_count--;
-				break;
+					// remove from list 
+					for(int j=i; j<job_count-1; j++){
+						jobs[j] = jobs[j+1];
+						jobs[j].id = j+1;
+
+					}
+					job_count--;
+					break;
+				}
 			}
 		}
+	}
+}
+
+void sigint_handler(int sig) {
+	(void)sig;
+	if(fg_pid > 0) {
+		kill(fg_pid, SIGINT);
+	}
+}
+
+void sigtstp_handler(int sig) {
+	(void)sig;
+	if(fg_pid > 0) {
+		kill (fg_pid, SIGTSTP);
+
+		// mark as stopped job
+		jobs[job_count].id = job_count + 1;
+		jobs[job_count].pid = fg_pid;
+		strcpy(jobs[job_count].cmd, "stopped-foreground");
+		jobs[job_count].stopped = 1;
+		job_count++;
 	}
 }
 
 int main() {
 	char *line = NULL;
 	size_t bufsize = 0;
+	
+	signal(SIGINT, sigint_handler);
+	signal(SIGTSTP, sigtstp_handler);
 
 	while(1) {
 		//printf("my_shell> ");
