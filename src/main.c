@@ -58,7 +58,7 @@ void shell_execute(char **args){
 	}
 	
 	int background = 0;
-	for(int i=0; args[i] != NULL, i++) {
+	for(int i=0; args[i] != NULL; i++) {
 		if(strcmp(args[i], "&") == 0 && args[i+1] == NULL) {
 			background = 1;
 			args[i] = NULL;
@@ -123,12 +123,18 @@ void shell_execute(char **args){
 	else if(pid > 0) {
 		if(background) {
 			printf("[bg] %d\n", pid);
+
+			// store job
+			jobs[job_count].id = job_count+1;
+			jobs[job_count].pid = pid;
+			strncpy(jobs[job_count].cmd , args[0], sizeof(jobs[job_count].cmd));
+			job_count++;
 		}
 		else {
 			int status;
 			waitpid(pid, &status, 0);
-	}
-	else {
+		}
+	}else {
 		perror("fork");
 	}
 }
@@ -167,6 +173,15 @@ void print_prompt(){
 void execute_pipeline(char ***commands, int n) {
 	int pipes[n-1][2];
 	pid_t pids[n];
+	
+	int background = 0;
+	for(int k=0; commands[n-1][k] != NULL; k++) {
+		if(strcmp(commands[n-1][k], "&") == 0 && commands[n-1][k+1] == NULL) {
+			background = 1;
+			commands[n-1][k] = NULL;
+			break;
+		}
+	}
 
 	// create pipes
 	for(int i=0; i<n-1; i++){
@@ -175,7 +190,8 @@ void execute_pipeline(char ***commands, int n) {
 			exit(1);
 		}
 	}
-
+	
+	// fork processes
 	for(int i=0; i<n; i++) {
 		pids[i] = fork();
 		if(pids[i] == 0) {
@@ -255,6 +271,16 @@ void execute_pipeline(char ***commands, int n) {
 		close(pipes[i][1]);
 	}
 
+	if(background) {
+		printf("[bg] pipeline (pid %d)\n", pids[n-1]);
+
+		// store only last PID to track pipeline job
+		jobs[job_count].id = job_count+1;
+		jobs[job_count].pid = pids[n-1];
+		strncpy(jobs[job_count].cmd, commands[0][0], sizeof(jobs[job_count].cmd));
+		job_count++;
+	}
+
 	// wait for all children
 	for (int i=0; i<n; i++) {
 		waitpid(pids[i], NULL, 0);
@@ -304,7 +330,7 @@ void shell_execute_line(char *line) {
 void check_background_jobs() {
 	int status;
 	pid_t pid;
-	while((pid == waitpid(-1, &status, WNOHANG)) > 0) {
+	while((pid = waitpid(-1, &status, WNOHANG)) > 0) {
 		for(int i=0; i<job_count; i++){
 			if(jobs[i].pid == pid) {
 				printf("[done] %s (pid %d)\n", jobs[i].cmd, pid);
