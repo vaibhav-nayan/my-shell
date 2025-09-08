@@ -4,11 +4,13 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <ctype.h>
+#include <readline/readline.h>
+#include <readline/history.h>
 
 #define MAX_TOKENS 100
 #define MAX_CMDS 20
-
-pid_t fg_pid = -1;
+#define MAX_HISTORY 1000
 
 typedef struct {
 	int id;
@@ -19,6 +21,66 @@ typedef struct {
 
 Job jobs[100];
 int job_count = 0;
+pid_t fg_pid = -1;
+char *history[MAX_HISTORY];
+int history_count = 0;
+
+// trim trailing newline
+static void trim_newline(char *s){
+	size_t len = strlen(s);
+	if(len > 0 && s[len-1] == '\n') s[len-1] = '\0';
+}
+
+// add history
+void add_history_entry(const char *line) {
+	if(line == NULL) return;
+	char *clean = strdup(line);
+	if(!clean) return;
+	trim_newline(clean);
+
+	if(history_count > 0 && strcmp(history[history_count-1], clean) == 0) {
+		free(clean);
+		return;
+	}
+
+	if(history_count < MAX_HISTORY) {
+		history[history_count++] = clean;
+	} else {
+		free(history[0]);
+		for(int i=1; i<MAX_HISTORY; i++) history[i-1] = history[i];
+		history[MAX_HISTORY-1] = clean;
+	}
+}
+
+// expand history
+char *expand_history(const char *line) {
+	if(line == NULL) return NULL;
+
+	// work on local copy
+	char tmp[MAX_TOKENS * 32];
+	strncpy(tmp, line, sizeof(tmp)-1);
+	tmp[sizeof(tmp)-1] = '\0';
+	trim_newline(tmp);
+
+	if(strcmp(tmp, "!!") == 0) {
+		if(history_count == 0) {
+			printf("mysh: no commands in history\n");
+			return NULL;
+		}
+		return strdup(history[history_count -1]);
+	}
+
+	if(tmp[0] == '!' && isdigit((unsigned char)tmp[1])) {
+		int idx = atoi(tmp+1)-1;
+		if(idx < 0 || idx >= history_count) {
+			printf("mysh: no such command in history: %s\n", tmp);
+			return NULL;
+		}
+		return strdup(history[idx]);
+	}
+
+	return strdup(tmp);
+}
 
 // cd
 void shell_cd(char **args) {
@@ -79,6 +141,12 @@ void shell_bg(int job_id) {
 	}
 }
 
+void shell_history() {
+	for(int i=0; i<history_count; i++) {
+		printf("%d %s\n", i+1, history[i]);
+	}
+}
+
 // Execute command
 void shell_execute(char **args){
 	
@@ -97,6 +165,7 @@ void shell_execute(char **args){
 	}
 	if(strcmp(args[0], "jobs") == 0) {
 		shell_jobs();
+		return;
 	}
 	if(strcmp(args[0], "fg") == 0) {
 		if(args[1] != NULL && args[1][0] == '%') {
@@ -111,6 +180,10 @@ void shell_execute(char **args){
 		} else {
 			printf("usage: bg %%jobid\n");
 		}
+	}
+	if(strcmp(args[0], "history") == 0) {
+		shell_history();
+		return;
 	}
 	
 	int background = 0;
@@ -371,7 +444,23 @@ int parse_pipeline(char *line, char ***commands) {
 
 // dispatcher
 void shell_execute_line(char *line) {
-	char *line_copy = strdup(line);
+	if(line == NULL) return;
+
+	char *expanded = expand_history(line);
+	if(!expanded) return;
+
+	add_history_entry(expanded);
+
+	if(strcmp(expanded, "history") == 0) {
+		shell_history();
+		free(expanded);
+		return;
+	}
+	
+	char *line_copy = strdup(expanded);
+	if(!line_copy) { free(expanded); return; }
+	free(expanded);
+
 	char **commands[MAX_CMDS];
 	int n= parse_pipeline(line_copy, commands);
 
@@ -431,24 +520,65 @@ void sigtstp_handler(int sig) {
 	}
 }
 
+char *command_generator(const char *text, int state) {
+	static int list_index, len;
+	static char *commands[] = {
+		"cd", "pwd", "exit", "jobs", "fg", "bg", "history", NULL
+	};
+
+	if(!state) {
+		list_index = 0;
+		len = strlen(text);
+	}
+
+	while(commands[list_index]) {
+		char *name = commands[list_index];
+		list_index++;
+		if(strncmp(name, text, len) == 0) {
+			return strdup(name);
+		}
+	}
+	return NULL;
+}
+
+char **my_completion(const char *text, int start, int end) {
+	(void)start; (void)end;
+	return rl_completion_matches(text, command_generator);
+}
+
+char *make_prompt() {
+	static char prompt[1024];
+	char cwd[512];
+	char *user = getenv("USER");
+
+	if(getcwd(cwd, sizeof(cwd)) != NULL) {
+		snprintf(prompt, sizeof(prompt), "%s:%s$ ", user? user: "user", cwd);
+	} else {
+		snprintf(prompt, sizeof(prompt), "$ ");
+	}
+	return prompt;
+}
+
 int main() {
+	rl_attempted_completion_function = my_completion;
+
 	char *line = NULL;
-	size_t bufsize = 0;
-	
 	signal(SIGINT, sigint_handler);
 	signal(SIGTSTP, sigtstp_handler);
 
 	while(1) {
-		//printf("my_shell> ");
-		print_prompt();
-		if(getline(&line, &bufsize, stdin) == -1){
-			break;
+		line = readline(make_prompt());
+
+		if(!line) break;
+
+		if(strlen(line) > 0) {
+			add_history(line);
+			shell_execute_line(line);
 		}
 
-		shell_execute_line(line);
+		free(line);
 		check_background_jobs();
 	}
-
 	free(line);
 	return 0;
 }
