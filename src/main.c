@@ -11,6 +11,9 @@
 #define MAX_TOKENS 100
 #define MAX_CMDS 20
 #define MAX_HISTORY 1000
+#define MAX_VARS 100
+#define MAX_VAR_NAME 64
+#define MAX_VAR_VALUE 256
 
 typedef struct {
 	int id;
@@ -19,11 +22,21 @@ typedef struct {
 	int stopped;
 } Job;
 
+typedef struct {
+	char name[MAX_VAR_NAME];
+	char value[MAX_VAR_VALUE];
+} ShellVar;
+
+
 Job jobs[100];
 int job_count = 0;
 pid_t fg_pid = -1;
 char *history[MAX_HISTORY];
 int history_count = 0;
+ShellVar shell_vars[MAX_VARS];
+int var_count = 0;
+
+
 
 // trim trailing newline
 static void trim_newline(char *s){
@@ -80,6 +93,51 @@ char *expand_history(const char *line) {
 	}
 
 	return strdup(tmp);
+}
+
+// set/update local variable
+void set_local_var(const char *name, const char *value){
+	if(!name) return;
+	for(int i=0; i<var_count; i++){
+		if(strcmp(shell_vars[i].name, name) == 0) {
+			strncpy(shell_vars[i].value, value? value: "", sizeof(shell_vars[i].value)-1);
+			shell_vars[i].value[sizeof(shell_vars[i].value)-1] = '\0';
+			return;
+		}
+	}
+
+	if(var_count < MAX_VARS) {
+		strncpy(shell_vars[var_count].name, name, sizeof(shell_vars[var_count].name)-1);
+		shell_vars[var_count].name[sizeof(shell_vars[var_count].name)-1] = '\0';
+		strncpy(shell_vars[var_count].value, value? value: "", sizeof(shell_vars[var_count].value)-1);
+		shell_vars[var_count].value[sizeof(shell_vars[var_count].value)-1] = '\0';
+		var_count++;
+	}
+}
+
+// get local var
+const char* get_local_var(const char *name) {
+	if(!name) return NULL;
+	for(int i=0; i<var_count; i++){
+		if(strcmp(shell_vars[i].name, name) == 0) {
+			return shell_vars[i].value;
+		}
+	}
+	return NULL;
+}
+
+// unset
+void unset_local_var(const char *name) {
+	if (!name) return;
+	for(int i=0; i<var_count; i++) {
+		if(strcmp(shell_vars[i].name, name) == 0) {
+			for(int j=i; j<var_count-1; j++) {
+				shell_vars[j] = shell_vars[j+1];
+			}
+			var_count--;
+			return;
+		}
+	}
 }
 
 // cd
@@ -152,6 +210,29 @@ void shell_execute(char **args){
 	
 	if(args[0] == NULL) return;
 
+	if(args[0] != NULL) {
+		char *eq = strchr(args[0], '=');
+		if(eq != NULL && args[1] == NULL) {
+			size_t namelen = eq-args[0];
+			if(namelen > 0 && namelen < MAX_VAR_NAME) {
+				char name[MAX_VAR_NAME];
+				memcpy(name, args[0], namelen);
+				name[namelen] = '\0';
+
+				int ok = (isalpha((unsigned char)name[0]) || name[0] == '_');
+				for(size_t k = 1; k<namelen && ok; ++k) {
+					if(!(isalnum((unsigned char)name[k]) || name[k] == '_')) ok = 0;
+				}
+				if(ok) {
+					const char *value = eq + 1;
+					set_local_var(name, value);
+					return;
+				}
+			}
+		}
+	}
+
+	// built ins
 	if(strcmp(args[0], "cd") == 0){
 		shell_cd(args);
 		return;
@@ -185,6 +266,22 @@ void shell_execute(char **args){
 		shell_history();
 		return;
 	}
+	if(strcmp(args[0], "export") == 0) {
+		if(args[1]) {
+			const char *val = get_local_var(args[1]);
+			if(val) {
+				setenv(args[1], val, 1);
+			}
+		}
+		return;
+	}
+	if(strcmp(args[0], "unset") == 0) {
+		if(args[1]) {
+			unset_local_var(args[1]);
+			unsetenv(args[1]);
+		}
+		return;
+	}
 	
 	int background = 0;
 	for(int i=0; args[i] != NULL; i++) {
@@ -193,6 +290,14 @@ void shell_execute(char **args){
 			args[i] = NULL;
 			break;
 		}
+	}
+
+	// variable assignment check
+	char *eq = strchr(args[0], '=');
+	if(eq != NULL) {
+		*eq = '\0';
+		set_local_var(args[0], eq+1);
+		return;
 	}
 
 	pid_t pid = fork();
@@ -283,6 +388,19 @@ char **parse_line(char *line){
 		token = strtok(NULL, " \t\r\n");
 	}
 	tokens[pos] = NULL;
+
+	for(int j=0; j<pos; j++){
+		if(tokens[j][0] == '$') {
+			const char *val = get_local_var(tokens[j] + 1);
+			if(!val) val = getenv(tokens[j] + 1);
+			if(val) {
+				tokens[j] = strdup(val);
+			} else {
+				tokens[j] = strdup("");
+			}
+		}
+	}
+
 	return tokens;
 }
 
@@ -420,6 +538,73 @@ void execute_pipeline(char ***commands, int n) {
 	}
 }
 
+char *expand_token(const char *token) {
+	if (!token) return NULL;
+	size_t tlen = strlen(token);
+	size_t cap = tlen + 64;
+	char *out = malloc(cap);
+	if(!out) return NULL;
+	size_t oi = 0;
+
+	for(size_t i=0; i<tlen; ++i) {
+		if(token[i] == '$') {
+			size_t j = i+1;
+
+			// variable name: [A-Za-z]
+			if(j < tlen && (isalpha((unsigned char)token[j]) || token[j] == '_')) {
+				size_t start = j;
+				while(j<tlen && (isalnum((unsigned char)token[j]) || token[j] == '_')) j++;
+				size_t varlen = j-start;
+				char varname[256];
+				if(varlen >= sizeof(varname)) varlen = sizeof(varname) -1;
+				memcpy(varname, token + start, varlen);
+				varname[varlen] = '\0';
+
+				const char *val = get_local_var(varname);
+				if(!val) val = getenv(varname);
+				if(!val) val = "";
+
+				size_t vlen = strlen(val);
+				if(oi + vlen + 1 > cap) {
+					cap = oi + vlen + 64;
+					char *tmp = realloc(out, cap);
+					if(!tmp) {
+						free(out);
+						return NULL;
+					}
+					out = tmp;
+				}
+				memcpy(out+oi, val, vlen);
+				oi += vlen;
+
+				i = j-1;
+				continue;
+			} else {
+				if(oi + 2 > cap) {
+					cap = oi + 64;
+					char *tmp = realloc(out, cap);
+					if(!tmp) {free(out); return NULL;}
+					out = tmp;
+				}
+				out[oi++] = '$';
+				continue;
+			}
+		} else {
+			if(oi + 2 > cap) {
+				cap = oi + 64;
+				char *tmp = realloc(out, cap);
+				if(!tmp) {free(out); return NULL;}
+				out = tmp;
+			}
+			out[oi++] = token[i];
+		}
+	}
+
+	out[oi] = '\0';
+	return out;
+}
+
+
 // parse pipeline
 int parse_pipeline(char *line, char ***commands) {
 	int cmd_count = 0;
@@ -427,11 +612,19 @@ int parse_pipeline(char *line, char ***commands) {
 
 	while(cmd != NULL && cmd_count < MAX_CMDS) {
 		commands[cmd_count] = malloc(MAX_TOKENS * sizeof(char*));
+		if(!commands[cmd_count]) return cmd_count;
+
 
 		int pos = 0;
 		char * token = strtok(cmd, " \t\r\n");
 		while(token != NULL && pos < MAX_TOKENS-1) {
-			commands[cmd_count][pos++] = token;
+
+			char *expanded = expand_token(token);
+			if(expanded) {
+				commands[cmd_count][pos++] = expanded;
+			} else {
+				commands[cmd_count][pos++] = strdup(token);
+			}
 			token = strtok(NULL, " \t\r\n");
 		}
 		commands[cmd_count][pos] = NULL;
