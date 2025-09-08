@@ -752,12 +752,18 @@ char *make_prompt() {
 	return prompt;
 }
 
-int main() {
+int main(int argc, char *argv[]) {
 	rl_attempted_completion_function = my_completion;
 
 	char *line = NULL;
 	signal(SIGINT, sigint_handler);
 	signal(SIGTSTP, sigtstp_handler);
+
+	if(argc == 3 && strcmp(argv[1], "-c") == 0) {
+		shell_execute_line(argv[2]);
+		check_background_jobs();
+		return 0;
+	}
 
 	while(1) {
 		line = readline(make_prompt());

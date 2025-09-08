@@ -9,3 +9,9 @@ all:
 
 clean:
 	rm -f $(OUT)
+
+docker-build:
+	docker build -t my_shell .
+
+docker-run:
+	docker run -it my_shell
